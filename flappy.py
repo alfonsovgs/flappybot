@@ -1,35 +1,31 @@
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Value
 from multiprocessing.managers import BaseManager, BaseProxy
 import Quartz
 import Quartz.CoreGraphics as CG
 import cv2
 import numpy
+import math
 import pickle
 import time
 
 
-kPaddingTop = 50
+kPaddingTop = 59
 kFieldHeight = 370
 kBirdX = 105
 kBirdWidth = 20
 kPipePixelThreshold = 100
 kPipeMaxWidth = 70
 kPipeMinWidth = 3
-kPipeMinOpening = 60
+kPipeMinOpening = 90
 kBeakMinColor = numpy.array([1, 100, 100], numpy.uint8)
 kBeakMaxColor = numpy.array([20, 255, 255], numpy.uint8)
 kBeakMinSize = 3
 kBeakMaxLength = 10
-kClimbAltGain = 40.0
-kClimbDuration = 0.265
-
-def tap_main(tap_queue):
-  while True:
-    tap_queue.get() # blocking
-    fd = open("/dev/tty.usbserial-A6008aIZ", "w")
-    fd.write("1")
-    fd.close()
-    #print "Tap!", time.time()
+kClimbAltGain = 40
+kClimbDuration = 0.18
+kSpeed = 131.31
+kLatencyAdjust = 0.3
+kTapCycle = 0.595
 
 
 class State(object):
@@ -69,7 +65,6 @@ class GameUI(object):
   def __init__(self, tap_queue):
     self.window_id = self.get_window_id()
     self.capture_img = numpy.zeros((568, 320, 4), numpy.uint8)
-    self.last_tap_ts = None
     cv2.namedWindow('monitor')
     cv2.namedWindow('field')
     self.tap_queue = tap_queue
@@ -109,7 +104,6 @@ class GameUI(object):
 
   def tap(self):
     self.tap_queue.put_nowait(True)
-    self.last_tap_ts = time.time()
 
   def capture_images(self):
     self.capture_window(self.capture_img, self.window_id)
@@ -118,7 +112,8 @@ class GameUI(object):
         kBirdX - kBirdWidth / 2 : kBirdX + kBirdWidth / 2]
     blue, _, _ = cv2.split(self.display_image)
     _, bw_image = cv2.threshold(blue, 140, 255, cv2.THRESH_BINARY)
-    self.field_image = bw_image[kPaddingTop:kPaddingTop + kFieldHeight, kBirdX:]
+    self.field_image = bw_image[kPaddingTop:kPaddingTop + kFieldHeight,
+        kBirdX - kBirdWidth:]
 
   def _find_pipe(self):
     havg = cv2.reduce(self.field_image, 0, cv2.cv.CV_REDUCE_AVG)[0]
@@ -161,7 +156,7 @@ class GameUI(object):
         if height >= kBeakMinSize:
           if best is None or best[1] < height:
             best = (y, height)
-    cv2.imshow('bird filtered', threshed)
+    # cv2.imshow('bird filtered', threshed)
     return None if best is None else best[0] + 8  # Aim for the center
 
   def get_state(self):
@@ -174,6 +169,7 @@ class GameUI(object):
     cv2.imshow('field', self.field_image)
 
   def highlight_state(self, state):
+    self._highlight_grid()
     if state:
       self._highlight_pipe(state)
     if state.bird_y:
@@ -195,6 +191,28 @@ class GameUI(object):
         (state.pipe_x + state.pipe_width + kBirdX + 5, kPaddingTop + state.pipe_top_h + opening_h / 2),
         (0, 255, 0), 3, 8)
 
+  def _highlight_grid(self):
+    for y in range(50, kFieldHeight, 50):
+      cv2.line(self.display_image,
+          (0, kPaddingTop + y), (320, kPaddingTop + y),
+          (200, 200, 200), 1 + int(y % 100 == 0), 8)
+      cv2.line(self.display_image,
+          (y, kPaddingTop), (y, kPaddingTop + kFieldHeight),
+          (200, 200, 200), 1 + int(y % 100 == 0), 8)
+
+  def highlight_est_trajectory(self, last_state, last_tap_ts, tap_y):
+    points = []
+    t1 = last_state.timestamp - last_tap_ts
+    for ti in range(0, 40):
+      t = ti * 0.05
+      y = self.est_bird_y(last_tap_ts, tap_y, last_tap_ts + t)
+      points.append((int((t - t1) * kSpeed + kBirdX), int(y + kPaddingTop)))
+    def plot(p):
+      for i in range(1, len(p)):
+        cv2.line(self.display_image, p[i-1], p[i],
+            (0, 250, 0), 4, 8)
+    plot(points)
+
   def __del__(self):
     cv2.destroyAllWindows()
 
@@ -210,101 +228,120 @@ def throttle(key, hz, ts_dict=dict()):
   return max(0.0, left)
 
 
-class FlightMode:
-  FLOAT = 1
-  CLIMB = 2
-  DIVE = 3
+def autopilot_main(published_state, tap_queue, last_tap_ts):
+  tap_y = [None]
+  addtl_float_multiplier = [1.0]
 
-
-def autopilot_main(published_state, tap_queue):
-  last_tap_ts = [time.time()]
-  last_mode = [None]
-  def autopilot_logic(last_state):
-    do_tap = False
-    since_tap = time.time() - last_tap_ts[0]
+  def autopilot(state_buffer, last_state):
+    if not state_buffer:
+      print "WARNING: State buffer empty!"
+      state_buffer = [last_state]
+    if last_state.bird_y is None:
+      return
+    ys = sorted([s.bird_y for s in state_buffer if s.bird_y is not None])
+    med_y = ys[len(ys) / 2]
+    tap_ts = last_tap_ts.value
+    since_tap = time.time() - tap_ts
     if last_state:
-      target = last_state.pipe_top_h + last_state.opening_h() / 2
-      dive_x = since_tap - kClimbDuration
-      state_x = last_state.timestamp - last_tap_ts[0] - kClimbDuration
-      if dive_x >= 0 and state_x >= 0:
-        est_y = last_state.bird_y + 600.0 * (dive_x**2 - state_x**2)
-      else:
-        est_y = last_state.bird_y
+      target = last_state.pipe_top_h + last_state.opening_h() * 0.5
     else:
       target = 200.0
-      est_y = last_state.bird_y
-      dive_x, state_x = 0, 0
 
-    mode = FlightMode.FLOAT
-    if last_state.bird_y:
-      delta = last_state.bird_y - target
-      if delta >= 60:
-        mode = FlightMode.CLIMB
-      elif delta <= -60 and since_tap >= kClimbDuration:
-        mode = FlightMode.DIVE
+    def _float_adjust(delta):
+      if delta < 0:
+        multiplier = 0.85 * addtl_float_multiplier[0]
+      elif delta > 10:
+        multiplier = 1.15
       else:
-        mode = FlightMode.FLOAT
-    mode = FlightMode.FLOAT
+        multiplier = 1
+      if since_tap > kTapCycle * multiplier:
+        tap_queue.put_nowait(True)
+        addtl_float_multiplier[0] = 1.0
 
-    if mode == FlightMode.FLOAT:
-      multiplier = 1.0
-      if est_y:
-        if est_y > target:
-          multiplier = 0.8
-        elif est_y < target:
-          multiplier = 1.2
-      if since_tap > 0.578 * multiplier:
-        do_tap = True
-    elif mode == FlightMode.CLIMB:
-      if since_tap > 0.2:
-        do_tap = True
-    elif mode == FlightMode.DIVE:
-      if dive_x >= 0 and state_x >= 0:
-        #if not throttle('blabla', 10):
-        #  print "Dive est y", est_y, dive_x, state_x, time.time()
-        if est_y >= target:
-          do_tap = True
+    def _fall_position_est(y0, t):
+      kA = 458.314
+      kB = 85.0
+      kC = -1.43
+      y = kA * t**2 + kB * t + kC
+      return y0 + int(y)
 
-    if mode != last_mode[0]:
-      print mode, target, last_state.bird_y, do_tap
-      last_mode[0] = mode
+    def _dive_to(target):
+      points = [(s.timestamp, s.bird_y) for s in state_buffer \
+          if s.bird_y is not None]
+      if len(points) < 2:
+        return
+      # find apex
+      i = len(points) - 1
+      while i > 0 and points[i - 1][1] < points[i][1]:
+        i -= 1
+      est_y = _fall_position_est(points[i][1],
+          time.time() - points[i][0] + kLatencyAdjust)
+      #print "DIVE est y", est_y, " instead of ", last_state.bird_y, "target", \
+      #    target
+      if est_y > target - 15 and since_tap >= kTapCycle:
+        tap_queue.put_nowait(True)
 
-    if do_tap:
-      tap_queue.put_nowait(True)
-      last_tap_ts[0] = time.time()
+    def _climb(height):
+      for i in range(int(math.ceil((height - 30) / kClimbAltGain))):
+        tap_queue.put_nowait(True)
+        time.sleep(kClimbDuration)
+      time.sleep(kLatencyAdjust)
 
+    if med_y < target - 70:
+       _dive_to(target)
+    elif med_y > target + 50:
+      _climb(med_y - target)
+      # addtl_float_multiplier[0] = 0.9
+    else:
+      _float_adjust(target - med_y)
+
+  state_buffer = []
   while True:
     last_state = published_state._getvalue()
-    #if not throttle('autopilot monitor', 1):
-    #  print '>', last_state
-    autopilot_logic(last_state)
+    now = time.time()
+    state_buffer.append(last_state)
+    while state_buffer and state_buffer[0].timestamp < now - kTapCycle:
+      state_buffer = state_buffer[1:]
+    autopilot(state_buffer, last_state)
+    if not throttle('autopilot monitor', 10):
+      print '>', last_state
     time.sleep(throttle('autopilot', 30))
 
 
-def game_main(tap_queue, published_state):
+def game_main(tap_queue, published_state, last_tap_ts):
   game = GameUI(tap_queue)
   state_log = [(None, [])]
   last_state = None
   while True:
-    if not throttle('capture', 20):
+    if not throttle('capture', 60):
       game.capture_images()
       last_state = game.get_state()
       state_log[-1][1].append(last_state)
-    if not throttle('monitor', 10):
+    if not throttle('monitor', 60):
       game.highlight_state(last_state)
       game.refresh_monitors()
     key = cv2.waitKey(1) & 0xFF
     if key == 27:   # Esc
       break
     elif key == 32: # Space
-      if not throttle('tap', 100):
+      if not throttle('tap', 120):
         game.tap()
-        state_log.append((game.last_tap_ts, []))
+        state_log.append((time.time(), []))
       else:
         print "Declined keyboard tap"
     published_state.update(last_state)
-    time.sleep(throttle('loop', 30))
+    time.sleep(throttle('loop', 60))
   open("/tmp/flappybot.log", "w").write(pickle.dumps(state_log))
+
+
+def tap_main(tap_queue, last_tap_ts):
+  while True:
+    tap_queue.get()
+    fd = open("/dev/tty.usbserial-A6008aIZ", "w")
+    fd.write("1")
+    fd.close()
+    last_tap_ts.value = time.time()
+    print "Tap!", last_tap_ts.value
 
 
 class StateProxy(BaseProxy):
@@ -317,21 +354,20 @@ class FlappyManager(BaseManager):
   pass
 
 FlappyManager.register('State', State, proxytype=StateProxy)
-FlappyManager.register('Queue', Queue)
-
 
 
 def main():
   process_manager = FlappyManager()
   process_manager.start()
-  tap_queue = process_manager.Queue()
+  tap_queue = Queue()
   published_state = process_manager.State()
-  tap_proc = Process(target=tap_main, args=(tap_queue,))
+  last_tap_ts = Value('d', time.time())
+  tap_proc = Process(target=tap_main, args=(tap_queue, last_tap_ts))
   tap_proc.start()
   autopilot_proc = Process(target=autopilot_main,
-      args=(published_state, tap_queue,))
+      args=(published_state, tap_queue, last_tap_ts))
   autopilot_proc.start()
-  game_main(tap_queue, published_state)
+  game_main(tap_queue, published_state, last_tap_ts)
   autopilot_proc.terminate()
   tap_proc.terminate()
 
