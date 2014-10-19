@@ -3,13 +3,14 @@ from multiprocessing.managers import BaseManager, BaseProxy
 import Quartz
 import Quartz.CoreGraphics as CG
 import cv2
-import numpy
 import math
+import numpy
 import pickle
+import serial
 import time
 
 
-kPaddingTop = 59
+kPaddingTop = 40
 kFieldHeight = 370
 kBirdX = 105
 kBirdWidth = 20
@@ -75,8 +76,7 @@ class GameUI(object):
         CG.kCGWindowListOptionAll,
         CG.kCGNullWindowID)
     for window in windows:
-      if ('wickedman' in window.get(CG.kCGWindowName, '')
-          and 'X-Mirage' in window.get(CG.kCGWindowOwnerName, '')) \
+      if ('wickedman' in window.get(CG.kCGWindowName, '')) \
           or 'test_screenshot' in window.get(CG.kCGWindowName, ''):
         return window[CG.kCGWindowNumber]
     raise Exception("Couldn't find capture window")
@@ -317,7 +317,7 @@ def game_main(tap_queue, published_state, last_tap_ts):
       game.capture_images()
       last_state = game.get_state()
       state_log[-1][1].append(last_state)
-    if not throttle('monitor', 60):
+    if not throttle('monitor', 0.1):
       game.highlight_state(last_state)
       game.refresh_monitors()
     key = cv2.waitKey(1) & 0xFF
@@ -335,13 +335,13 @@ def game_main(tap_queue, published_state, last_tap_ts):
 
 
 def tap_main(tap_queue, last_tap_ts):
+  ser = serial.Serial('/dev/tty.usbmodemfd121', 115200)
   while True:
     tap_queue.get()
-    fd = open("/dev/tty.usbserial-A6008aIZ", "w")
-    fd.write("1")
-    fd.close()
+    ser.write("1")
     last_tap_ts.value = time.time()
     print "Tap!", last_tap_ts.value
+  ser.close()
 
 
 class StateProxy(BaseProxy):
